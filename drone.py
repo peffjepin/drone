@@ -2,6 +2,9 @@
 
 import argparse
 import os
+import sys
+import shlex
+import subprocess
 import pathlib
 import signal
 import time
@@ -21,6 +24,86 @@ def error(msg):
     raise SystemExit(1)
 
 
+class Drone:
+    def __init__(self, addr, cli):
+        self.addr = addr
+        self.running = False
+        self.cli = cli
+        self.current_subprocess = None
+
+        self.watch_dirs = []
+        if cli.watch:
+            if not cli.on_update:
+                error(
+                    "Drone was given directories to watch for changes in but "
+                    "no command to call in `--on-update`")
+            for p in cli.watch.split(","):
+                self.watch_dirs.append(pathlib.Path(p))
+
+        self.watch_dict = {}
+        self.watch_triggered = False
+        self.check_watch_dirs()
+
+    def check_watch_dirs(self):
+        for wd in self.watch_dirs:
+            for p in wd.iterdir():
+                last_edit = p.stat().st_mtime
+                record = self.watch_dict.get(p)
+                if record is None or record != last_edit:
+                    self.watch_triggered = True
+                self.watch_dict[p] = last_edit
+        self.previous_watch_dirs_check = time.time()
+
+    def run_command(self, cmd):
+        print(f"file update detected, running: {cmd}")
+        if self.cli.patient:
+            subprocess.run(
+                shlex.split(cmd), stdout=sys.stdout, stderr=sys.stderr)
+        else:
+            if self.current_subprocess and self.current_subprocess.poll() is None:
+                self.current_subprocess.kill()
+            self.current_subprocess = subprocess.Popen(
+                shlex.split(cmd), stdout=sys.stdout, stderr=sys.stderr)
+
+    def stop(self, *args):
+        self.running = False
+
+    def run(self):
+        self.running = True
+        print(f"Starting drone at: {self.addr}")
+        signal.signal(signal.SIGINT, lambda *a: self.stop())
+        try:
+            os.mkfifo(self.addr)
+        except FileExistsError:
+            os.unlink(self.addr)
+            os.mkfifo(self.addr)
+        fd = os.open(self.addr, os.O_RDONLY | os.O_NONBLOCK)
+        while self.running:
+            time.sleep(POLL)
+            if self.watch_dirs and time.time() > self.previous_watch_dirs_check + self.cli.watch_interval:
+                self.check_watch_dirs()
+            if self.watch_triggered:
+                self.run_command(self.cli.on_update)
+                self.watch_triggered = False
+            try:
+                buffer = os.read(fd, self.cli.buffer_size)
+            except OSError as exc:
+                if exc.errno == errno.EWOULDBLOCK or exc.errno == errno.EAGAIN:
+                    buffer = None
+                else:
+                    os.close(fd)
+                    os.unlink(fd)
+                    raise
+            if buffer is not None:
+                cmds = buffer.decode("utf-8").splitlines()
+                for cmd in cmds:
+                    if cmd == EXIT:
+                        error("received remote exit signal")
+                    self.run_command(cmd)
+
+        os.unlink(self.addr)
+
+
 def init_drone(args):
     drones = [d for d in DRONES.iterdir()]
     names = set(d.name for d in drones)
@@ -33,41 +116,8 @@ def init_drone(args):
             int_id += 1
         id = str(int_id)
 
-    drone = DRONES / id
-    running = True
-
-    def stop():
-        nonlocal running
-        running = False
-
-    print(f"Starting drone at: {drone}")
-    signal.signal(signal.SIGINT, lambda *a: stop())
-    try:
-        os.mkfifo(drone)
-    except FileExistsError:
-        os.unlink(drone)
-        os.mkfifo(drone)
-    fd = os.open(drone, os.O_RDONLY | os.O_NONBLOCK)
-    while running:
-        try:
-            buffer = os.read(fd, args.buffer_size)
-        except OSError as exc:
-            if exc.errno == errno.EWOULDBLOCK or exc.errno == errno.EAGAIN:
-                buffer = None
-            else:
-                os.close(fd)
-                os.unlink(fd)
-                raise
-        if buffer is not None:
-            cmds = buffer.decode("utf-8").splitlines()
-            for cmd in cmds:
-                if cmd == EXIT:
-                    error("received remote exit signal")
-                os.system(cmd)
-        else:
-            time.sleep(POLL)
-
-    os.unlink(drone)
+    drone = Drone(DRONES/id, args)
+    drone.run()
 
 
 def select_drone(drones, id):
@@ -123,6 +173,18 @@ def main():
     init.add_argument(
         "-i", "--id", help="specify an identifier for this instance"
     )
+    init.add_argument(
+        "-w", "--watch",
+        help="comma separated directories to watch for file changes in")
+    init.add_argument(
+        "-u", "--on-update",
+        help="command to run when a file in a watched directory is updated")
+    init.add_argument(
+        "--watch-interval", type=float, default=0.5,
+        help="the interval (s) to check for changes in watched directories [0.5s]")
+    init.add_argument(
+        "-p", "--patient", action="store_true",
+        help="if not set then previous commands will be terminated when a new command is received")
     init.add_argument(
         "-b", "--buffer-size", default=1024, type=int,
         help="expecting commands to fit within buffer [1024]")
