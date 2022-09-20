@@ -42,7 +42,11 @@ def init_drone(args):
 
     print(f"Starting drone at: {drone}")
     signal.signal(signal.SIGINT, lambda *a: stop())
-    os.mkfifo(drone)
+    try:
+        os.mkfifo(drone)
+    except FileExistsError:
+        os.unlink(drone)
+        os.mkfifo(drone)
     fd = os.open(drone, os.O_RDONLY | os.O_NONBLOCK)
     while running:
         try:
